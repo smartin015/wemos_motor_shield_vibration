@@ -44,6 +44,7 @@
 I2C_HandleTypeDef hi2c1;
 
 TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim14;
 TIM_HandleTypeDef htim16;
 TIM_HandleTypeDef htim17;
 
@@ -58,6 +59,7 @@ static void MX_TIM16_Init(void);
 static void MX_TIM17_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM14_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -65,69 +67,171 @@ static void MX_I2C1_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// Data is loaded onto the microcontroller in "frames" (chunks),
+// effectively making this a ring buffer with NFRAME items of length
+// FRAME_SAMPLES.
+// Note the STM32F030F4 has only 4K SRAM so this buffer must stay small
+#define NFRAME 4
+#define FRAME_SAMPLES 200*2
+uint8_t wav_buffer[NFRAME][FRAME_SAMPLES];
+volatile uint8_t frame_idx;  // Where to read sample data
+volatile uint8_t frame_buf_idx; // Where to write the next incoming frame
+volatile uint16_t sample_idx; // Which sample in frame_idx to read next
+
+
+// PCM treats 0x00 as -amp_max and 0xff as amp_max.
+#define WAV_ZERO 0x80
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == htim16.Instance) {
+
+  if (htim->Instance == htim16.Instance) {
     	// Toggle Motor A direction
     	HAL_GPIO_TogglePin(GPIOA, AIN1_Pin|AIN2_Pin);
-    } else if (htim->Instance == htim17.Instance) {
+  } else if (htim->Instance == htim17.Instance) {
     	// Toggle A3/A4, Motor B direction
     	HAL_GPIO_TogglePin(GPIOA, BIN1_Pin|BIN2_Pin);
-    }
+  } else if (htim->Instance == htim14.Instance) {
+      if (frame_idx == frame_buf_idx) {
+        return; // We're caught up; no more data to read.
+      }
+
+      // Load next WAV PCM sample
+      uint8_t vA = wav_buffer[frame_idx][sample_idx++];
+      uint8_t vB = wav_buffer[frame_idx][sample_idx++];
+
+      // Advance to the next frame if we've read the current one,
+      // Wrapping around when we reach the end.
+      if (sample_idx >= FRAME_SAMPLES) {
+        sample_idx = 0;
+        frame_idx = (frame_idx + 1) % NFRAME;
+      }
+      
+      // Set direction based on whether we're in the top or lower half of the waveform
+      HAL_GPIO_WritePin(GPIOA, AIN1_Pin, (vA >= WAV_ZERO) ? GPIO_PIN_SET   : GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOA, AIN2_Pin, (vA >= WAV_ZERO) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+      HAL_GPIO_WritePin(GPIOA, BIN1_Pin, (vB >= WAV_ZERO) ? GPIO_PIN_SET   : GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOA, BIN2_Pin, (vB >= WAV_ZERO) ? GPIO_PIN_RESET : GPIO_PIN_SET);
+
+      // We shift and remove the sign bit to get the absolute amplitude
+      uint8_t vccrA = ((uint8_t)(vA - 128)) & (~0x80);
+      htim3.Instance->CCR1 = vccrA;
+      uint8_t vccrB = ((uint8_t)(vB - 128)) & (~0x80);
+      htim3.Instance->CCR2 = vccrB;
+  } else {
+    // "This should never happen"
+    Error_Handler();
+  }
 }
 
+#define CMD_PACKET_SZ 6
 #define F_CLK 48000000
 #define PSC 4
-#define VLIM 1000
+#define VLIM 256
 
-void setFreq(uint16_t fA, uint16_t fB, uint8_t volA, uint8_t volB) {
+void setFreq(uint8_t channel, uint16_t freq, uint8_t vol) {
+  // Frequency mode uses tim16 (motor 1) and tim17 (motor 2) to 
+  // trigger interrupts which are used to toggle the GPIO pins specifying direction.
+  // Volume is controlled by setting the duty cycle of tim3.
+
 	// Freq = Fclk / ((ARR+1)*(PSC+1))
 	// (Fclk / (Freq * (PSC+1))) - 1 = ARR
-	HAL_TIM_Base_Stop_IT(&htim16);
-	HAL_TIM_Base_Stop_IT(&htim17);
 
-	htim3.Instance->CCR1 = (volA * VLIM) / 256;
-	htim3.Instance->CCR2 = (volB * VLIM) / 256;
-
-
-	if (fA == 0) {
-		HAL_GPIO_WritePin(GPIOA, AIN1_Pin|AIN2_Pin, GPIO_PIN_RESET);
-	} else {
-		uint16_t arrA =  F_CLK / (fA * (PSC+1)) - 1;
-		htim16.Instance->ARR = arrA;
-		htim16.Instance->CCR1 = arrA / 2; // 50% duty cycle
-		HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_RESET);
-		HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_SET);
-		HAL_TIM_Base_Start_IT(&htim16);
-	}
-	if (fB == 0) {
-		HAL_GPIO_WritePin(GPIOA, BIN1_Pin|BIN2_Pin, GPIO_PIN_RESET);
-	} else {
-		uint16_t arrB =  F_CLK / (fB * (PSC+1)) - 1;
-		htim17.Instance->ARR = arrB;
-		htim17.Instance->CCR1 = arrB / 2; // 50% duty cycle
-		HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_RESET);
-		HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_SET);
-		HAL_TIM_Base_Start_IT(&htim17);
-	}
+  if (channel == 0) {
+  	HAL_TIM_Base_Stop_IT(&htim16);
+  	htim3.Instance->CCR1 = (vol * VLIM) / 256;
+    if (freq == 0) {
+      HAL_GPIO_WritePin(GPIOA, AIN1_Pin|AIN2_Pin, GPIO_PIN_RESET);
+    } else {
+      uint16_t arr =  F_CLK / (freq * (PSC+1)) - 1;
+      htim16.Instance->ARR = arr;
+      htim16.Instance->CCR1 = arr / 2; // 50% duty cycle
+      HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_SET);
+      HAL_TIM_Base_Start_IT(&htim16);
+    }
+  } else {
+  	HAL_TIM_Base_Stop_IT(&htim17);
+	htim3.Instance->CCR2 = (vol * VLIM) / 256;
+    if (freq == 0) {
+      HAL_GPIO_WritePin(GPIOA, BIN1_Pin|BIN2_Pin, GPIO_PIN_RESET);
+    } else {
+      uint16_t arr =  F_CLK / (freq * (PSC+1)) - 1;
+      htim17.Instance->ARR = arr;
+      htim17.Instance->CCR1 = arr / 2; // 50% duty cycle
+      HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_SET);
+      HAL_TIM_Base_Start_IT(&htim17);
+    }
+  }
 }
 
-void demoloop() {
-	setFreq(440, 220, 127, 127);
-	HAL_Delay(500);
-	setFreq(220, 440, 127, 127);
-	HAL_Delay(500);
-	setFreq(220, 880, 127, 127);
-	HAL_Delay(500);
-	setFreq(440, 220, 255, 255);
-	HAL_Delay(500);
-	setFreq(220, 440, 255, 255);
-	HAL_Delay(500);
-	setFreq(220, 880, 255, 255);
-	HAL_Delay(500);
-	setFreq(0,0,0,0);
-	HAL_Delay(500);
+void startWavMode() {
+  // Wav mode uses tim14 to advance the data buffer and set the next PCM
+  // sample. 
+
+  // Disable freq mode timers so they don't vibrate the brush
+  setFreq(0, 0, 0);
+  setFreq(1, 0, 0);  
+
+  HAL_TIM_Base_Stop_IT(&htim14);
+  frame_idx = 0;
+  sample_idx = 0;
+  frame_buf_idx = 0;
+  HAL_TIM_Base_Start_IT(&htim14);
 }
+
+void stopWavMode() {
+  HAL_TIM_Base_Stop_IT(&htim14);
+  setFreq(0, 0, 0);
+  setFreq(1, 0, 0);
+}
+
+void demoWav() {
+  startWavMode(); // Start consuming data
+  while (1) {
+    // Keep the buffer filled
+    if ((frame_buf_idx+1) % NFRAME != frame_idx) {
+      for (uint16_t i = 0; i < FRAME_SAMPLES; i+= 2) { // Skip every other byte; only fill channel 1
+          wav_buffer[frame_buf_idx][i] = i & 0xff; // Simple sawtooth, 8 bits @ 44.1kHz ~= 172 Hz tone
+      }
+      frame_buf_idx = (frame_buf_idx+1) % NFRAME;
+    } 
+  }
+}
+
+void demoFreq() {
+  while (1) {
+	setFreq(0, 440, 127);
+	setFreq(1, 220, 127);
+	HAL_Delay(500);
+	setFreq(0, 220, 127);
+	setFreq(1, 440, 127);
+	HAL_Delay(500);
+	setFreq(0, 220, 127);
+	setFreq(1, 880, 127);
+	HAL_Delay(500);
+	setFreq(0, 440, 255);
+	setFreq(1, 220, 255);
+	HAL_Delay(500);
+	setFreq(0, 220, 255);
+	setFreq(1, 440, 255);
+	HAL_Delay(500);
+	setFreq(0, 220, 255);
+	setFreq(1, 880, 255);
+	HAL_Delay(500);
+	setFreq(0, 0, 0);
+	setFreq(1, 0, 0);
+	HAL_Delay(500);
+  }
+}
+
+uint8_t freq_buffer[CMD_PACKET_SZ];
+enum  Mode {
+  MODE_UNKNOWN,
+  MODE_FREQ,
+  MODE_WAV,
+} mode = MODE_UNKNOWN;
 
 /* USER CODE END 0 */
 
@@ -163,13 +267,13 @@ int main(void)
   MX_TIM17_Init();
   MX_TIM3_Init();
   MX_I2C1_Init();
+  MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
 
-  // 50% duty cycle
-  // htim3.Instance->CCR1 = 16000/2;
-  // htim3.Instance->CCR2 = 16000/2;
+  setFreq(0,0,0);
+  setFreq(1,0,0);
+  mode = MODE_FREQ; // Default to frequency mode
 
-  setFreq(0,0,0,0);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -180,14 +284,37 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-	  uint8_t buffer[6];
-	  if (HAL_I2C_Slave_Receive(&hi2c1, buffer, sizeof(buffer), HAL_MAX_DELAY) == HAL_OK) {
-		  uint16_t fA = buffer[0] + (buffer[1] << 8);
-		  uint16_t fB = buffer[2] + (buffer[3] << 8);
-		  uint8_t vA = buffer[4];
-		  uint8_t vB = buffer[5];
-		  setFreq(fA, fB, vA, vB);
-	  }
+	switch (mode) {
+      case MODE_FREQ:
+        if (HAL_I2C_Slave_Receive(&hi2c1, freq_buffer, CMD_PACKET_SZ, HAL_MAX_DELAY) == HAL_OK) {
+          uint16_t fA = freq_buffer[0] + (freq_buffer[1] << 8);
+          uint16_t fB = freq_buffer[2] + (freq_buffer[3] << 8);
+          uint8_t vA = freq_buffer[4];
+          uint8_t vB = freq_buffer[5];
+          if (fA == 0 && fB == 0 && vA == 255 && vB == 255) {
+            // Interpret screaming at 0Hz as "I want to use wav mode"
+            mode = MODE_WAV;
+            startWavMode();
+          } else {
+            setFreq(0, fA, vA);
+            setFreq(1, fB, vB);
+          }
+        }
+        break;  
+      case MODE_WAV:
+        if (HAL_I2C_Slave_Receive(&hi2c1, wav_buffer[frame_buf_idx], FRAME_SAMPLES, HAL_MAX_DELAY) == HAL_OK) {
+          if (strncmp((char*)(wav_buffer[frame_buf_idx]), "\ff\00\ff\00FREQ", 8) == 0) {
+            mode = MODE_FREQ;
+            stopWavMode();
+          } else {
+            frame_buf_idx = (frame_buf_idx + 1) % NFRAME;
+          }
+        }
+        break;
+      case MODE_UNKNOWN:
+      default:
+        break;
+    }
 //	  if (HAL_I2C_Slave_Transmit(&hi2c1, (uint8_t *)"OK", 2, HAL_MAX_DELAY) != HAL_OK) {
 //		  continue;
 //		  //Error_Handler();
@@ -309,7 +436,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 1000;
+  htim3.Init.Period = 256;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -332,7 +459,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 500;
+  sConfigOC.Pulse = 256;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
@@ -344,12 +471,58 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM3_Init 2 */
+  // tim3 should always be running, as it's the carrier upon which volume is expressed
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
 
 
   /* USER CODE END TIM3_Init 2 */
   HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
+  * @brief TIM14 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM14_Init(void)
+{
+
+  /* USER CODE BEGIN TIM14_Init 0 */
+  // 48000000 / 44100 = 1088.43537
+  /* USER CODE END TIM14_Init 0 */
+
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM14_Init 1 */
+
+  /* USER CODE END TIM14_Init 1 */
+  htim14.Instance = TIM14;
+  htim14.Init.Prescaler = 0;
+  htim14.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim14.Init.Period = 1088;
+  htim14.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim14.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim14) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim14, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM14_Init 2 */
+
+  /* USER CODE END TIM14_Init 2 */
 
 }
 
@@ -508,7 +681,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = AIN2_Pin|AIN1_Pin|BIN1_Pin|BIN2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : S_STAY_Pin */
