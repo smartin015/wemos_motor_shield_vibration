@@ -72,13 +72,11 @@ static void MX_TIM14_Init(void);
 // FRAME_SAMPLES.
 // Note the STM32F030F4 has only 4K SRAM so this buffer must stay small
 #define NFRAME 4
-#define FRAME_SAMPLES 200*2
+#define FRAME_SAMPLES 16*2
 uint8_t wav_buffer[NFRAME][FRAME_SAMPLES];
 volatile uint8_t frame_idx;  // Where to read sample data
 volatile uint8_t frame_buf_idx; // Where to write the next incoming frame
 volatile uint16_t sample_idx; // Which sample in frame_idx to read next
-
-
 // PCM treats 0x00 as -amp_max and 0xff as amp_max.
 #define WAV_ZERO 0x80
 
@@ -92,6 +90,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     	// Toggle A3/A4, Motor B direction
     	HAL_GPIO_TogglePin(GPIOA, BIN1_Pin|BIN2_Pin);
   } else if (htim->Instance == htim14.Instance) {
+	  // htim14 handles wav data frame advancement
+
       if (frame_idx == frame_buf_idx) {
         return; // We're caught up; no more data to read.
       }
@@ -129,41 +129,55 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 #define PSC 4
 #define VLIM 256
 
+uint16_t last_freqs[2] = {0,0};
+uint8_t last_vols[2] = {0,0};
 void setFreq(uint8_t channel, uint16_t freq, uint8_t vol) {
-  // Frequency mode uses tim16 (motor 1) and tim17 (motor 2) to 
-  // trigger interrupts which are used to toggle the GPIO pins specifying direction.
-  // Volume is controlled by setting the duty cycle of tim3.
+	// Frequency mode uses tim16 (motor 1) and tim17 (motor 2) to
+	// trigger interrupts which are used to toggle the GPIO pins specifying direction.
+	// Volume is controlled by setting the duty cycle of tim3.
+	// Registers are only set if the frequency has changed - this prevents
+	// blips/noise when setting the same frequency
 
-	// Freq = Fclk / ((ARR+1)*(PSC+1))
-	// (Fclk / (Freq * (PSC+1))) - 1 = ARR
+	// 2*freq as we're triggering an interrupt every half-period
+	freq *= 2;
 
-  if (channel == 0) {
-  	HAL_TIM_Base_Stop_IT(&htim16);
-  	htim3.Instance->CCR1 = (vol * VLIM) / 256;
-    if (freq == 0) {
-      HAL_GPIO_WritePin(GPIOA, AIN1_Pin|AIN2_Pin, GPIO_PIN_RESET);
-    } else {
-      uint16_t arr =  F_CLK / (freq * (PSC+1)) - 1;
-      htim16.Instance->ARR = arr;
-      htim16.Instance->CCR1 = arr / 2; // 50% duty cycle
-      HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_SET);
-      HAL_TIM_Base_Start_IT(&htim16);
-    }
-  } else {
-  	HAL_TIM_Base_Stop_IT(&htim17);
-	htim3.Instance->CCR2 = (vol * VLIM) / 256;
-    if (freq == 0) {
-      HAL_GPIO_WritePin(GPIOA, BIN1_Pin|BIN2_Pin, GPIO_PIN_RESET);
-    } else {
-      uint16_t arr =  F_CLK / (freq * (PSC+1)) - 1;
-      htim17.Instance->ARR = arr;
-      htim17.Instance->CCR1 = arr / 2; // 50% duty cycle
-      HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_RESET);
-      HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_SET);
-      HAL_TIM_Base_Start_IT(&htim17);
-    }
-  }
+	volatile uint32_t* volccr;
+	TIM_HandleTypeDef* tim;
+	uint16_t p1, p2;
+	if (channel == 0) {
+		volccr = &(htim3.Instance->CCR1);
+		tim = &htim16;
+		p1 = AIN1_Pin;
+		p2 = AIN2_Pin;
+	} else {
+		volccr = &(htim3.Instance->CCR2);
+		tim = &htim17;
+		p1 = BIN1_Pin;
+		p2 = BIN2_Pin;
+	}
+
+	HAL_TIM_Base_Stop_IT(tim);
+	if (last_vols[channel] != vol) {
+		*volccr = (vol * VLIM) / 256;
+	}
+	if (freq == 0) {
+	  HAL_GPIO_WritePin(GPIOA, p1|p2, GPIO_PIN_RESET);
+	} else if (last_freqs[channel] != freq) {
+		// Freq = Fclk / ((ARR+1)*(PSC+1))
+		// (Fclk / (Freq * (PSC+1))) - 1 = ARR
+		uint16_t arr =  F_CLK / (freq * (PSC+1)) - 1;
+		tim->Instance->ARR = arr;
+		tim->Instance->CCR1 = arr / 2; // 50% duty cycle
+		HAL_GPIO_WritePin(GPIOA, p1, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOA, p2, GPIO_PIN_SET);
+	}
+
+	if (vol != 0 && freq != 0) {
+	  HAL_TIM_Base_Start_IT(tim);
+	}
+
+	last_vols[channel] = vol;
+	last_freqs[channel] = freq;
 }
 
 void startWavMode() {
@@ -181,7 +195,7 @@ void startWavMode() {
   HAL_TIM_Base_Start_IT(&htim14);
 }
 
-void stopWavMode() {
+void startFreqMode() {
   HAL_TIM_Base_Stop_IT(&htim14);
   setFreq(0, 0, 0);
   setFreq(1, 0, 0);
@@ -270,8 +284,7 @@ int main(void)
   MX_TIM14_Init();
   /* USER CODE BEGIN 2 */
 
-  setFreq(0,0,0);
-  setFreq(1,0,0);
+  startFreqMode();
   mode = MODE_FREQ; // Default to frequency mode
 
   /* USER CODE END 2 */
@@ -291,21 +304,25 @@ int main(void)
           uint16_t fB = freq_buffer[2] + (freq_buffer[3] << 8);
           uint8_t vA = freq_buffer[4];
           uint8_t vB = freq_buffer[5];
-          if (fA == 0 && fB == 0 && vA == 255 && vB == 255) {
-            // Interpret screaming at 0Hz as "I want to use wav mode"
-            mode = MODE_WAV;
-            startWavMode();
-          } else {
-            setFreq(0, fA, vA);
-            setFreq(1, fB, vB);
-          }
+
+          // TODO handle switching to and from WAV mode once WAV mode is useful
+//          if (fA == 0 && fB == 0 && vA == 255 && vB == 255) {
+//            // Interpret screaming at 0Hz as "I want to use wav mode"
+//            mode = MODE_WAV;
+//            startWavMode();
+//          } else {
+//            setFreq(0, fA, vA);
+//            setFreq(1, fB, vB);
+//          }
+          setFreq(0, fA, vA);
+          setFreq(1, fB, vB);
         }
         break;  
       case MODE_WAV:
         if (HAL_I2C_Slave_Receive(&hi2c1, wav_buffer[frame_buf_idx], FRAME_SAMPLES, HAL_MAX_DELAY) == HAL_OK) {
           if (strncmp((char*)(wav_buffer[frame_buf_idx]), "\ff\00\ff\00FREQ", 8) == 0) {
             mode = MODE_FREQ;
-            stopWavMode();
+            startFreqMode();
           } else {
             frame_buf_idx = (frame_buf_idx + 1) % NFRAME;
           }
@@ -384,8 +401,8 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x2000090E;
-  hi2c1.Init.OwnAddress1 = 130;
+  hi2c1.Init.Timing = 0x0000020B;
+  hi2c1.Init.OwnAddress1 = 126;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
